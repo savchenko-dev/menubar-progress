@@ -11,6 +11,9 @@ file; the `mbp` CLI writes it, a tiny menu bar app renders all of them.
 
 ## How
 
+0. Find the CLI. Examples below use `${CLAUDE_PLUGIN_ROOT}/bin/mbp`; if that variable is empty in
+   your shell, use `mbp` from PATH, or resolve it once:
+   `MBP=$(ls ~/.claude/plugins/cache/*/menubar-progress/*/bin/mbp | tail -1)`.
 1. Make sure the app runs: `${CLAUDE_PLUGIN_ROOT}/bin/mbp start` (idempotent, builds on first run).
 2. Pick the lightest way to feed a task:
    - **A command with a clear end**: wrap it. Running → ok/fail by exit code.
