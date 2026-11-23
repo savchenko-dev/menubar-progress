@@ -1,0 +1,16 @@
+{
+  "name": "savchenko-dev",
+  "description": "Claude Code plugins by savchenko-dev",
+  "owner": {
+    "name": "Danil Savchenko",
+    "url": "https://github.com/savchenko-dev"
+  },
+  "plugins": [
+    {
+      "name": "menubar-progress",
+      "description": "Progress of long-running and parallel jobs in the macOS menu bar.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}

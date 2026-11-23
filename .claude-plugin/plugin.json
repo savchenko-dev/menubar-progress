@@ -1,0 +1,12 @@
+{
+  "name": "menubar-progress",
+  "version": "0.1.0",
+  "description": "Progress of anything your agent (or you) runs - builds, crawls, batches, parallel jobs - in the macOS menu bar. One JSON file per task, a CLI with wrap/tail/set, and a skill that teaches the agent to use it.",
+  "author": {
+    "name": "Danil Savchenko",
+    "url": "https://github.com/savchenko-dev"
+  },
+  "homepage": "https://github.com/savchenko-dev/menubar-progress",
+  "license": "MIT",
+  "keywords": ["progress", "menubar", "macos", "observability", "background-jobs"]
+}
