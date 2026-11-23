@@ -70,7 +70,9 @@ final class Controller: NSObject {
     func start() {
         statusItem.button?.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
+        let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
     }
 
     func refresh() {
@@ -151,6 +153,7 @@ final class Controller: NSObject {
 }
 
 try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+let activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiatedAllowingIdleSystemSleep], reason: "menu bar progress refresh")
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let controller = Controller()
