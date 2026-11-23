@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""mbp - show progress of local processes in the macOS menu bar.
+
+Every tracked task is one JSON file in the state dir; the menu bar app renders
+whatever is there. Any process (agent, script, CI job) can report progress by
+calling this CLI or by writing the file itself.
+"""
+import argparse
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get('MBP_DIR', Path.home() / '.local/state/mbp'))
+CACHE_DIR = Path(os.environ.get('MBP_CACHE', Path.home() / '.cache/mbp'))
+APP_BIN = CACHE_DIR / 'mbp-app'
+APP_PID = CACHE_DIR / 'app.pid'
+APP_SRC = Path(__file__).resolve().parent.parent / 'app' / 'MenubarProgress.swift'
+STATES = ('running', 'wait', 'ok', 'fail')
+NUMERIC = ('done', 'total', 'ttl')
+
+
+def item_path(task_id):
+    return STATE_DIR / (re.sub(r'[^\w.-]', '_', task_id) + '.json')
+
+
+def read_item(task_id):
+    try:
+        return json.loads(item_path(task_id).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def write_item(task_id, **fields):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    item = read_item(task_id)
+    item.update({k: v for k, v in fields.items() if v is not None})
+    item['id'] = task_id
+    item['updated'] = time.time()
+    path = item_path(task_id)
+    tmp = path.with_suffix('.tmp')
+    tmp.write_text(json.dumps(item, ensure_ascii=False))
+    tmp.replace(path)
+    return item
+
+
+def all_items():
+    items = []
+    for path in sorted(STATE_DIR.glob('*.json')):
+        try:
+            items.append(json.loads(path.read_text()))
+        except ValueError:
+            pass
+    return items
+
+
+def app_pid():
+    try:
+        pid = int(APP_PID.read_text())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def build():
+    if APP_BIN.exists() and APP_BIN.stat().st_mtime >= APP_SRC.stat().st_mtime:
+        return
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    subprocess.run(['swiftc', '-O', '-o', str(APP_BIN), str(APP_SRC)], check=True)
+
+
+def cmd_start(args):
+    build()
+    pid = app_pid()
+    if pid:
+        print(f'mbp: already running (pid {pid})')
+        return
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.Popen([str(APP_BIN)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            start_new_session=True, env={**os.environ, 'MBP_DIR': str(STATE_DIR)})
+    APP_PID.write_text(str(proc.pid))
+    print(f'mbp: started (pid {proc.pid}), state dir {STATE_DIR}')
+
+
+def cmd_stop(args):
+    pid = app_pid()
+    if pid:
+        os.kill(pid, signal.SIGTERM)
+    APP_PID.unlink(missing_ok=True)
+    print('mbp: stopped')
+
+
+def cmd_status(args):
+    pid = app_pid()
+    print(f'mbp: running (pid {pid})' if pid else 'mbp: not running')
+
+
+def fields_from(args):
+    return {k: getattr(args, k, None) for k in
+            ('title', 'group', 'icon', 'state', 'done', 'total', 'text', 'open', 'ttl')}
+
+
+def cmd_set(args):
+    write_item(args.id, **fields_from(args))
+
+
+def cmd_finish(state):
+    def run(args):
+        fields = fields_from(args)
+        fields['state'] = state
+        write_item(args.id, **fields)
+    return run
+
+
+def cmd_rm(args):
+    for task_id in args.ids:
+        item_path(task_id).unlink(missing_ok=True)
+
+
+def cmd_clear(args):
+    for item in all_items():
+        if args.group and item.get('group') != args.group:
+            continue
+        if args.finished and item.get('state') not in ('ok', 'fail'):
+            continue
+        item_path(item['id']).unlink(missing_ok=True)
+
+
+def cmd_list(args):
+    items = all_items()
+    if args.json:
+        print(json.dumps(items, ensure_ascii=False, indent=2))
+        return
+    for item in items:
+        progress = ''
+        if item.get('total'):
+            progress = f" {item.get('done', 0):g}/{item['total']:g}"
+        group = f"[{item['group']}] " if item.get('group') else ''
+        print(f"{group}{item['id']}: {item.get('state', 'running')}{progress} {item.get('text', '')}".rstrip())
+
+
+def cmd_wrap(args):
+    """Run a command; mark the task running, then ok/fail by its exit code."""
+    command = args.command
+    if not command:
+        sys.exit('mbp wrap: no command given (use: mbp wrap <id> [options] -- cmd ...)')
+    fields = fields_from(args)
+    fields.update(state='running', text=args.text or ' '.join(command)[:80])
+    write_item(args.id, **fields)
+    started = time.time()
+    try:
+        code = subprocess.call(command)
+    except OSError as error:
+        print(f'mbp wrap: {error}', file=sys.stderr)
+        code = 127
+    took = int(time.time() - started)
+    write_item(args.id, state='ok' if code == 0 else 'fail',
+               text=f'exit {code} after {took // 60}m{took % 60:02d}s')
+    sys.exit(code)
+
+
+def cmd_tail(args):
+    """Follow a log file and turn the last line matching a regex into progress.
+
+    The regex may use named groups: done, total, text. Without named groups the
+    first two groups are taken as done and total.
+    """
+    pattern = re.compile(args.pattern)
+    end_ok = re.compile(args.ok) if args.ok else None
+    end_fail = re.compile(args.fail) if args.fail else None
+    fields = fields_from(args)
+    fields.update(state='running', open=args.open or str(Path(args.file).resolve()))
+    write_item(args.id, **fields)
+    offset = 0
+    while True:
+        try:
+            with open(args.file, errors='replace') as f:
+                f.seek(offset)
+                chunk = f.read()
+        except FileNotFoundError:
+            chunk = ''
+        body, sep, _ = chunk.rpartition('\n')
+        if sep:
+            offset += len((body + sep).encode())
+        update = {}
+        for line in body.splitlines():
+            if end_fail and end_fail.search(line):
+                write_item(args.id, state='fail', text=line.strip()[:120])
+                return
+            if end_ok and end_ok.search(line):
+                write_item(args.id, state='ok', text=line.strip()[:120])
+                return
+            match = pattern.search(line)
+            if not match:
+                continue
+            named = match.groupdict()
+            groups = match.groups()
+            done = named.get('done') or (groups[0] if groups else None)
+            total = named.get('total') or (groups[1] if len(groups) > 1 else None)
+            update = {'text': named.get('text') or line.strip()[:120]}
+            if done is not None:
+                update['done'] = float(done)
+            if total is not None:
+                update['total'] = float(total)
+        if update:
+            write_item(args.id, **update)
+        if args.pid and not pid_alive(args.pid):
+            if read_item(args.id).get('state') == 'running':
+                write_item(args.id, state='ok' if args.pid_exit_ok else 'wait', text='process exited')
+            return
+        time.sleep(args.every)
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def add_fields(parser, with_state=True):
+    parser.add_argument('--title', help='label in the menu (default: id)')
+    parser.add_argument('--group', help='group tasks under one header and one menu bar counter')
+    parser.add_argument('--icon', help='emoji or short text shown in the menu bar for the group')
+    if with_state:
+        parser.add_argument('--state', choices=STATES)
+    parser.add_argument('--done', type=float)
+    parser.add_argument('--total', type=float)
+    parser.add_argument('--text', help='free-form status line')
+    parser.add_argument('--open', help='path or URL opened when the menu item is clicked')
+    parser.add_argument('--ttl', type=float, help='drop the item this many seconds after it finishes')
+
+
+def main():
+    parser = argparse.ArgumentParser(prog='mbp', description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest='cmd', required=True)
+
+    sub.add_parser('start', help='build (if needed) and launch the menu bar app').set_defaults(func=cmd_start)
+    sub.add_parser('stop', help='quit the menu bar app').set_defaults(func=cmd_stop)
+    sub.add_parser('status', help='is the app running').set_defaults(func=cmd_status)
+    sub.add_parser('build', help='compile the app').set_defaults(func=lambda a: build())
+
+    p = sub.add_parser('set', help='create or update a task')
+    p.add_argument('id')
+    add_fields(p)
+    p.set_defaults(func=cmd_set)
+
+    for name, state in (('ok', 'ok'), ('fail', 'fail')):
+        p = sub.add_parser(name, help=f'mark a task {state}')
+        p.add_argument('id')
+        add_fields(p, with_state=False)
+        p.set_defaults(func=cmd_finish(state))
+
+    p = sub.add_parser('rm', help='remove tasks')
+    p.add_argument('ids', nargs='+')
+    p.set_defaults(func=cmd_rm)
+
+    p = sub.add_parser('clear', help='remove many tasks')
+    p.add_argument('--group')
+    p.add_argument('--finished', action='store_true', help='only ok/fail tasks')
+    p.set_defaults(func=cmd_clear)
+
+    p = sub.add_parser('list', help='print tasks')
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser('wrap', help='run a command as a task: running -> ok/fail by exit code')
+    p.add_argument('id')
+    add_fields(p, with_state=False)
+    p.set_defaults(func=cmd_wrap)
+
+    p = sub.add_parser('tail', help='follow a log file and parse progress out of it')
+    p.add_argument('id')
+    p.add_argument('file')
+    p.add_argument('--pattern', default=r'(\d+)\s*/\s*(\d+)',
+                   help='regex; named groups done/total/text or first two groups (default: N/M)')
+    p.add_argument('--ok', help='regex: a matching line marks the task ok and stops')
+    p.add_argument('--fail', help='regex: a matching line marks the task failed and stops')
+    p.add_argument('--pid', type=int, help='stop when this process exits')
+    p.add_argument('--pid-exit-ok', action='store_true', help='treat --pid exit as success')
+    p.add_argument('--every', type=float, default=5, help='poll interval, seconds')
+    add_fields(p, with_state=False)
+    p.set_defaults(func=cmd_tail)
+
+    argv = sys.argv[1:]
+    command = []
+    if '--' in argv:
+        split = argv.index('--')
+        argv, command = argv[:split], argv[split + 1:]
+    args = parser.parse_args(argv)
+    args.command = command
+    args.func(args)
+
+
+if __name__ == '__main__':
+    main()
